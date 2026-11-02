@@ -1,0 +1,250 @@
+package com.guitarmony.fretboard;
+
+import com.guitarmony.music.Catalog;
+import com.guitarmony.music.Family;
+import com.guitarmony.music.Formula;
+import com.guitarmony.music.Notes;
+import com.guitarmony.music.Tuning;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Objects;
+import java.util.Set;
+
+/**
+ * Generates physical fretboard regions from musical intervals and actual tuning.
+ * Modal and seven-note patterns use three ascending scale tones per string;
+ * pentatonic patterns use two. Their interval sequence continues across strings,
+ * including the G/B tuning transition, rather than copying the same fret offsets.
+ *
+ * <p>At the nut or fret 24, portions outside the instrument are clipped. In altered
+ * tunings the same ascending musical line can stretch or have clipped notes;
+ * these are reference patterns, not promises of ergonomic fingering. Arpeggio
+ * regions are explicitly note maps, never six-string chord voicings.</p>
+ */
+public final class ShapeEngine {
+    private static final int LAST_FRET = 24;
+    private static final int[] MAJOR = {0, 2, 4, 5, 7, 9, 11};
+
+    private ShapeEngine() { }
+
+    /** All 150 valid locations are tested; the calculation has constant bounded cost. */
+    public static Set<Cell> allNotes(Formula formula, int rootPitch, Tuning tuning) {
+        requireInputs(formula, tuning);
+        Set<Cell> cells = new LinkedHashSet<>();
+        for (int string = 0; string < 6; string++) {
+            for (int fret = 0; fret <= LAST_FRET; fret++) {
+                int interval = Math.floorMod(tuning.pitchAt(string, fret) - rootPitch, 12);
+                if (formula.contains(interval)) cells.add(new Cell(string, fret));
+            }
+        }
+        return immutable(cells);
+    }
+
+    /**
+     * First occurrence of root on the bass string at/after the requested fret.
+     * If no such occurrence remains below fret 24, uses the previous octave.
+     * This lets the UI state exactly where a root-anchored pattern was placed.
+     */
+    public static int nearestRootFret(int rootPitch, Tuning tuning, int anchorFret) {
+        Objects.requireNonNull(tuning, "tuning");
+        int requested = clamp(anchorFret);
+        int first = Math.floorMod(rootPitch - tuning.pitchAt(0, 0), 12);
+        while (first < requested) first += 12;
+        if (first > LAST_FRET) first -= 12;
+        return first;
+    }
+
+    /** A tonic-anchored reference pattern at the selected register. */
+    public static Position shape(Formula formula, int rootPitch, Tuning tuning, int anchorFret) {
+        requireInputs(formula, tuning);
+        int rootFret = nearestRootFret(rootPitch, tuning, anchorFret);
+        String label = Notes.chromatic(rootPitch, false) + " " + formula.name();
+        return positionAt(formula, rootPitch, tuning, rootFret, 0, label);
+    }
+
+    /**
+     * Selects one exact pentatonic/blues box by its zero-based degree rotation.
+     * Unlike indexing {@link #sequence}, this never substitutes a different box
+     * when a high register leaves only part of a cycle on the instrument.
+     * If the requested box's bass note would exceed fret 24, that same box is
+     * placed one octave earlier and its label explicitly states the fallback.
+     * Remaining notes outside the physical 0–24 range are clipped as usual.
+     */
+    public static Position boxShape(Formula formula, int rootPitch, Tuning tuning,
+                                     int anchorFret, int boxIndex) {
+        requireInputs(formula, tuning);
+        if (formula.family() != Family.PENTATONICS && formula.family() != Family.BLUES) {
+            throw new IllegalArgumentException("Desenhos numerados são de pentatônicas ou blues.");
+        }
+        Formula base = baseForBlues(formula);
+        if (boxIndex < 0 || boxIndex >= base.intervals().size()) {
+            throw new IllegalArgumentException("Número do desenho inválido.");
+        }
+        int bassFret = nearestRootFret(rootPitch, tuning, anchorFret)
+                + base.intervals().get(boxIndex);
+        boolean previousOctave = bassFret > LAST_FRET;
+        if (previousOctave) bassFret -= 12;
+        String label = formula.name() + " · desenho " + (boxIndex + 1)
+                + (previousOctave ? " · oitava anterior" : "");
+        return positionAt(formula, rootPitch, tuning, bassFret, boxIndex, label);
+    }
+
+    /**
+     * Modal sequence: related modes of ONE parent major scale, beginning with the
+     * selected mode and tonic. The second octave is repeated where it fits, to
+     * cover the 24-fret neck. For example E Ionian -> F# Dorian, never F Dorian.
+     *
+     * <p>Pentatonic/blues sequences rotate the five box starting degrees while
+     * retaining their original key. Other scales rotate their own scale degrees.
+     * The collection is capped at two cycles (14 modal / 10 pentatonic regions).
+     * No region is generated by merely recoloring the complete pitch collection.</p>
+     */
+    public static List<Position> sequence(Formula formula, int rootPitch,
+                                         Tuning tuning, int anchorFret) {
+        requireInputs(formula, tuning);
+        if (formula.family() == Family.MODES) {
+            return modalSequence(formula, rootPitch, tuning, anchorFret);
+        }
+        Formula base = baseForBlues(formula);
+        List<Integer> degrees = base.intervals().stream().sorted().toList();
+        List<Position> positions = new ArrayList<>();
+        int rootFret = nearestRootFret(rootPitch, tuning, anchorFret);
+        for (int octave = 0; octave < 2; octave++) {
+            for (int degree = 0; degree < degrees.size(); degree++) {
+                int fret = rootFret + degrees.get(degree) + octave * 12;
+                if (fret > LAST_FRET) continue;
+                String label = formula.name() + " · desenho " + (degree + 1)
+                        + (octave == 1 ? " · oitava" : "");
+                Position position = positionAt(formula, rootPitch, tuning, fret, degree, label);
+                if (!position.cells().isEmpty()) positions.add(position);
+            }
+        }
+        return List.copyOf(positions);
+    }
+
+    private static List<Position> modalSequence(Formula selected, int rootPitch,
+                                                Tuning tuning, int anchorFret) {
+        List<Formula> modes = Catalog.modes();
+        int selectedIndex = 0;
+        for (int i = 0; i < modes.size(); i++) {
+            if (modes.get(i).id().equals(selected.id())) {
+                selectedIndex = i;
+                break;
+            }
+        }
+        int rootFret = nearestRootFret(rootPitch, tuning, anchorFret);
+        List<Position> positions = new ArrayList<>();
+        for (int octave = 0; octave < 2; octave++) {
+            for (int offset = 0; offset < 7; offset++) {
+                int index = (selectedIndex + offset) % 7;
+                int displacement = Math.floorMod(MAJOR[index] - MAJOR[selectedIndex], 12);
+                int fret = rootFret + displacement + octave * 12;
+                if (fret > LAST_FRET) continue;
+                int modalRoot = Math.floorMod(rootPitch + displacement, 12);
+                Formula mode = modes.get(index);
+                String label = Notes.chromatic(modalRoot, false) + " " + mode.name()
+                        + (octave == 1 ? " · oitava" : "");
+                Position position = positionAt(mode, modalRoot, tuning, fret, 0, label);
+                if (!position.cells().isEmpty()) positions.add(position);
+            }
+        }
+        return List.copyOf(positions);
+    }
+
+    private static Position positionAt(Formula formula, int rootPitch, Tuning tuning,
+                                        int bassFret, int startingDegree, String label) {
+        Set<Cell> cells;
+        if (formula.family() == Family.ARPEGGIOS) {
+            // A compact arpeggio map, not a proposed playable chord grip.
+            int start = Math.max(0, Math.min(20, bassFret - 1));
+            cells = new LinkedHashSet<>();
+            for (Cell cell : allNotes(formula, rootPitch, tuning)) {
+                if (cell.fret() >= start && cell.fret() <= start + 4) cells.add(cell);
+            }
+        } else {
+            Formula base = baseForBlues(formula);
+            int notesPerString = base.intervals().size() <= 5 ? 2 : 3;
+            cells = ascendingPattern(base, tuning, bassFret, startingDegree, notesPerString);
+            if (formula.family() == Family.BLUES) {
+                addBlueNotes(cells, base, formula, rootPitch, tuning, bassFret, startingDegree);
+            }
+        }
+        int minimum = cells.stream().mapToInt(Cell::fret).min().orElse(clamp(bassFret));
+        int maximum = cells.stream().mapToInt(Cell::fret).max().orElse(clamp(bassFret));
+        return new Position(label, rootPitch, formula, cells, minimum, maximum);
+    }
+
+    /** Consecutive degree traversal preserves standard three-/two-note patterns. */
+    private static Set<Cell> ascendingPattern(Formula base, Tuning tuning, int bassFret,
+                                               int startingDegree, int notesPerString) {
+        Set<Cell> cells = new LinkedHashSet<>();
+        List<Integer> intervals = base.intervals();
+        int degree = Math.floorMod(startingDegree, intervals.size());
+        int baseMidi = tuning.midiAt(0, bassFret) - intervals.get(degree);
+        for (int string = 0; string < 6; string++) {
+            for (int note = 0; note < notesPerString; note++) {
+                int step = degree + string * notesPerString + note;
+                int midi = baseMidi + intervals.get(step % intervals.size())
+                        + 12 * (step / intervals.size());
+                int fret = midi - tuning.midiAt(string, 0);
+                if (fret >= 0 && fret <= LAST_FRET) cells.add(new Cell(string, fret));
+            }
+        }
+        return cells;
+    }
+
+    /**
+     * Includes chromatic blue tones within the two-note pattern or one fret after
+     * its second note. The latter is important: in the standard E-minor first
+     * box the G string is G-A-Bb (0-2-3), not just G-A. Ranges are calculated
+     * before clipping at the nut, so a blue tone on an open string is retained.
+     */
+    private static void addBlueNotes(Set<Cell> cells, Formula base, Formula blues,
+                                      int rootPitch, Tuning tuning, int bassFret,
+                                      int startingDegree) {
+        List<Integer> intervals = base.intervals();
+        int degree = Math.floorMod(startingDegree, intervals.size());
+        int baseMidi = tuning.midiAt(0, bassFret) - intervals.get(degree);
+        for (int string = 0; string < 6; string++) {
+            int step = degree + string * 2;
+            int firstMidi = baseMidi + intervals.get(step % intervals.size())
+                    + 12 * (step / intervals.size());
+            int lastMidi = baseMidi + intervals.get((step + 1) % intervals.size())
+                    + 12 * ((step + 1) / intervals.size());
+            int minimum = Math.max(0, firstMidi - tuning.midiAt(string, 0));
+            int maximum = Math.min(LAST_FRET, lastMidi - tuning.midiAt(string, 0) + 1);
+            for (int fret = minimum; fret <= maximum; fret++) {
+                int interval = Math.floorMod(tuning.pitchAt(string, fret) - rootPitch, 12);
+                if (blues.contains(interval) && !base.contains(interval)) {
+                    cells.add(new Cell(string, fret));
+                }
+            }
+        }
+    }
+
+    private static Formula baseForBlues(Formula formula) {
+        if (formula.family() != Family.BLUES) return formula;
+        String id = switch (formula.id()) {
+            case "blues-major" -> "penta-major";
+            case "blues-dominant" -> "penta-dominant";
+            case "blues-halfdim" -> "penta-halfdim";
+            default -> "penta-minor";
+        };
+        return Catalog.byId(id);
+    }
+
+    private static int clamp(int fret) {
+        return Math.max(0, Math.min(LAST_FRET, fret));
+    }
+
+    private static Set<Cell> immutable(Set<Cell> cells) {
+        return Collections.unmodifiableSet(new LinkedHashSet<>(cells));
+    }
+
+    private static void requireInputs(Formula formula, Tuning tuning) {
+        Objects.requireNonNull(formula, "formula");
+        Objects.requireNonNull(tuning, "tuning");
+    }
+}
